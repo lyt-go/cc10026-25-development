@@ -98,6 +98,89 @@ class CacheLayerService(BaseModuleService):
         write_module_snapshot(self.MODULE, snap)
         return {"ok": True, "api": api_name, "entries": entry_count}
 
+    @staticmethod
+    def _cache_key(api_name: str, query: str) -> str:
+        return f"{api_name}::{query}"
+
+    def identify_available_subs(self, batch_id: int) -> dict[str, list[dict[str, Any]]]:
+        """从批量查询快照（含待补数据）辨认当前真正可用的子项。
+
+        只有 confirmed=True 的子项可用于预热；超时未确认、迟到重报的子项排除在外。
+        返回 {"available": [...], "backlog": [...]}，供预热与值班排查分别使用。
+        """
+        from app.services.data_manager import read_module_snapshot
+        batch_snap = read_module_snapshot("batch_query")
+        if not batch_snap or batch_snap.get("batch_id") != batch_id:
+            return {"available": [], "backlog": []}
+        sub_results = batch_snap.get("sub_results", {})
+        available, backlog = [], []
+        for sub in sub_results.values():
+            if not isinstance(sub, dict):
+                continue
+            if sub.get("confirmed") and sub.get("status") == "success":
+                available.append(sub)
+            else:
+                backlog.append(sub)
+        return {"available": available, "backlog": backlog}
+
+    def warmup_confirmed(self, api_name: str, confirmed_subs: list[dict[str, Any]]) -> dict[str, Any]:
+        """按批量查询「已确认」的分项结果预热，超时/迟到重报不会被当成成功预热。
+
+        - 只接受 confirmed 子项，按 (api, query) 去重：迟到应答与重试不会重复写入。
+        - 已存在同键缓存条目的子项跳过，返回 skipped_duplicates。
+        - 无生效缓存策略时返回 ok=False，不写任何条目。
+        """
+        config = self.get_cache_config(api_name)
+        if not config:
+            return {"ok": False, "message": "无生效缓存策略", "entries": 0,
+                    "skipped_duplicates": 0, "keys": []}
+
+        from app.services.data_manager import read_module_snapshot, write_module_snapshot
+        snap = read_module_snapshot("cache_layer")
+        if not snap:
+            snap = {"module": self.MODULE, "caches": []}
+
+        existing_keys = {
+            c.get("cache_key") for c in snap.get("caches", [])
+            if isinstance(c, dict) and c.get("cache_key")
+        }
+
+        warmed_keys: list[str] = []
+        skipped = 0
+        for sub in confirmed_subs:
+            if not isinstance(sub, dict) or not sub.get("confirmed"):
+                continue  # 超时/未确认/迟到重报一律不预热
+            query = str(sub.get("query", ""))
+            if not query:
+                continue
+            key = self._cache_key(api_name, query)
+            if key in existing_keys:
+                # 重跑复用已确认结果时，缓存只认一次
+                skipped += 1
+                continue
+            existing_keys.add(key)
+            snap["caches"].append({
+                "api": api_name,
+                "query": query,
+                "cache_key": key,
+                "result_ref": sub.get("result_ref"),
+                "rows": sub.get("rows", 0),
+                "tier": config.get("tier", "L1"),
+                "ttl": config.get("ttl_seconds", 300),
+                "warmup_policy": config.get("warmup_policy", "按需加载"),
+                "source": "batch_confirmed",
+                "created_at": self._now_iso(),
+                "age": 0,
+            })
+            warmed_keys.append(key)
+
+        snap["_warmup_at"] = self._now_iso()
+        snap["_warmup_entries"] = len(warmed_keys)
+        snap["_warmup_skipped_duplicates"] = skipped
+        write_module_snapshot(self.MODULE, snap)
+        return {"ok": True, "api": api_name, "entries": len(warmed_keys),
+                "skipped_duplicates": skipped, "keys": warmed_keys}
+
     def _now_iso(self) -> str:
         from datetime import datetime, timedelta, timezone
         return datetime.now(timezone(timedelta(hours=8))).isoformat()
